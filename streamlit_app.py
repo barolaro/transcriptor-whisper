@@ -1,146 +1,192 @@
-import streamlit as st
-import whisper
-from docx import Document
-import tempfile
+import hashlib
+import io
 import os
-import subprocess
+import tempfile
 from pathlib import Path
 
-st.set_page_config(page_title="Transcriptor de Audio", layout="centered")
+import streamlit as st
+from docx import Document
+from faster_whisper import WhisperModel
 
-st.title("📝 Transcriptor de Audio con Whisper")
-st.write(
-    "Sube un archivo de audio y genera su transcripción en texto y Word. "
-    "Formatos compatibles: mp3, wav, m4a, mp4, aac."
+
+st.set_page_config(
+    page_title="Transcriptor de Audio",
+    page_icon="🎙️",
+    layout="centered",
 )
 
-@st.cache_resource
-def load_model():
-    return whisper.load_model("base")
+SUPPORTED_FORMATS = ["mp3", "wav", "m4a", "mp4", "aac", "ogg", "webm"]
+MODEL_OPTIONS = {
+    "Rápido (recomendado)": "tiny",
+    "Mayor precisión": "base",
+}
 
 
-def convertir_a_wav(input_path):
-    output_path = input_path + "_convertido.wav"
-
-    comando = [
-        "ffmpeg",
-        "-y",
-        "-i", input_path,
-        "-ar", "16000",
-        "-ac", "1",
-        "-c:a", "pcm_s16le",
-        output_path
-    ]
-
-    result = subprocess.run(
-        comando,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True
+@st.cache_resource(show_spinner=False)
+def load_model(model_name: str) -> WhisperModel:
+    """Carga una sola vez el modelo optimizado para CPU."""
+    cpu_threads = max(1, min(4, os.cpu_count() or 1))
+    return WhisperModel(
+        model_name,
+        device="cpu",
+        compute_type="int8",
+        cpu_threads=cpu_threads,
+        num_workers=1,
     )
 
-    if result.returncode != 0:
-        raise Exception("No se pudo convertir el audio. Verifica que ffmpeg esté instalado.")
 
-    if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-        raise Exception("El archivo convertido quedó vacío.")
-
-    return output_path
-
-
-def obtener_duracion_audio(path):
-    comando = [
-        "ffprobe",
-        "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        path
-    ]
-
-    result = subprocess.run(
-        comando,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True
-    )
-
+@st.cache_data(show_spinner=False, max_entries=20, ttl=86_400)
+def transcribe_audio(
+    audio_bytes: bytes,
+    suffix: str,
+    model_name: str,
+) -> tuple[str, float]:
+    """Transcribe y guarda temporalmente resultados idénticos por 24 horas."""
+    temp_path = None
     try:
-        return float(result.stdout.strip())
-    except Exception:
-        return 0
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+            temp_file.write(audio_bytes)
+            temp_path = temp_file.name
 
+        model = load_model(model_name)
+        segments, info = model.transcribe(
+            temp_path,
+            language="es",
+            beam_size=1,
+            best_of=1,
+            temperature=0,
+            vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 500},
+            condition_on_previous_text=False,
+            without_timestamps=True,
+        )
+
+        text = " ".join(segment.text.strip() for segment in segments).strip()
+        return text, float(info.duration)
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def create_word_document(text: str, original_name: str) -> bytes:
+    document = Document()
+    document.add_heading("Transcripción de audio", 0)
+    document.add_paragraph(f"Archivo: {original_name}")
+    document.add_paragraph(text)
+
+    buffer = io.BytesIO()
+    document.save(buffer)
+    return buffer.getvalue()
+
+
+def reset_result_if_file_changed(file_id: str) -> None:
+    if st.session_state.get("current_file_id") != file_id:
+        st.session_state.current_file_id = file_id
+        st.session_state.pop("transcription", None)
+        st.session_state.pop("duration", None)
+
+
+st.title("🎙️ Transcriptor de Audio")
+st.write(
+    "Sube un audio y obtén su transcripción en español. "
+    "El procesamiento comienza solo cuando presionas **Transcribir**."
+)
+
+model_label = st.radio(
+    "Velocidad de transcripción",
+    options=list(MODEL_OPTIONS),
+    horizontal=True,
+    help=(
+        "El modo rápido consume menos CPU. Usa Mayor precisión si el audio "
+        "tiene ruido, varias voces o términos técnicos."
+    ),
+)
 
 uploaded_file = st.file_uploader(
     "📂 Sube tu archivo de audio",
-    type=["mp3", "wav", "m4a", "mp4", "aac"]
+    type=SUPPORTED_FORMATS,
 )
 
 if uploaded_file is not None:
-    tmp_path = None
-    wav_path = None
-    word_file = None
+    audio_bytes = uploaded_file.getvalue()
+    file_id = hashlib.sha256(audio_bytes).hexdigest()
+    reset_result_if_file_changed(file_id)
 
-    try:
-        suffix = Path(uploaded_file.name).suffix.lower()
+    size_mb = len(audio_bytes) / (1024 * 1024)
+    st.caption(f"{uploaded_file.name} · {size_mb:.1f} MB")
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(uploaded_file.getbuffer())
-            tmp_path = tmp.name
+    if size_mb > 200:
+        st.error("El archivo supera el límite de 200 MB.")
+        st.stop()
 
-        duracion = obtener_duracion_audio(tmp_path)
+    if st.button("🚀 Transcribir audio", type="primary", use_container_width=True):
+        suffix = Path(uploaded_file.name).suffix.lower() or ".audio"
+        selected_model = MODEL_OPTIONS[model_label]
 
-        if duracion < 1:
-            st.warning("⚠️ El audio parece estar vacío o dura menos de 1 segundo.")
-            st.stop()
-
-        with st.spinner("🔄 Convirtiendo audio a formato compatible..."):
-            wav_path = convertir_a_wav(tmp_path)
-
-        with st.spinner("🔄 Cargando modelo Whisper..."):
-            model = load_model()
-
-        with st.spinner("🔄 Transcribiendo audio, espera un momento..."):
-            result = model.transcribe(
-                wav_path,
-                language="es",
-                fp16=False,
-                verbose=False,
-                condition_on_previous_text=False
-            )
-
-        transcription = result.get("text", "").strip()
-
-        if not transcription:
-            st.warning("⚠️ No se detectó texto. Verifica que el audio tenga voz clara.")
-        else:
-            st.success("✅ Transcripción completa")
-
-            st.subheader("📄 Texto transcrito:")
-            st.write(transcription)
-
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp_docx:
-                word_file = tmp_docx.name
-
-            doc = Document()
-            doc.add_heading("Transcripción de Audio", 0)
-            doc.add_paragraph(transcription)
-            doc.save(word_file)
-
-            with open(word_file, "rb") as f:
-                st.download_button(
-                    label="📥 Descargar Word",
-                    data=f.read(),
-                    file_name="transcripcion.docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        try:
+            with st.status(
+                "Preparando el modelo y transcribiendo…",
+                expanded=True,
+            ) as status:
+                st.write(
+                    "La primera transcripción puede tardar más mientras se "
+                    "descarga y carga el modelo."
+                )
+                transcription, duration = transcribe_audio(
+                    audio_bytes,
+                    suffix,
+                    selected_model,
+                )
+                status.update(
+                    label="Transcripción finalizada",
+                    state="complete",
+                    expanded=False,
                 )
 
-    except Exception as e:
-        st.error(f"❌ Error al procesar el audio: {e}")
+            st.session_state.transcription = transcription
+            st.session_state.duration = duration
+        except Exception as exc:
+            st.error(
+                "No fue posible procesar el audio. Comprueba que el archivo "
+                "no esté dañado e inténtalo nuevamente."
+            )
+            st.exception(exc)
 
-    finally:
-        for path in [tmp_path, wav_path, word_file]:
-            if path and os.path.exists(path):
-                try:
-                    os.remove(path)
-                except Exception:
-                    pass
+    transcription = st.session_state.get("transcription")
+    if transcription:
+        duration = st.session_state.get("duration", 0)
+        st.success(f"✅ Listo. Audio procesado: {duration / 60:.1f} minutos.")
+        st.subheader("📄 Texto transcrito")
+        edited_text = st.text_area(
+            "Puedes corregir el texto antes de descargarlo:",
+            value=transcription,
+            height=320,
+            label_visibility="collapsed",
+        )
+
+        base_name = Path(uploaded_file.name).stem
+        word_bytes = create_word_document(edited_text, uploaded_file.name)
+
+        col1, col2 = st.columns(2)
+        col1.download_button(
+            "📥 Descargar TXT",
+            data=edited_text.encode("utf-8"),
+            file_name=f"{base_name}_transcripcion.txt",
+            mime="text/plain",
+            use_container_width=True,
+        )
+        col2.download_button(
+            "📥 Descargar Word",
+            data=word_bytes,
+            file_name=f"{base_name}_transcripcion.docx",
+            mime=(
+                "application/vnd.openxmlformats-officedocument."
+                "wordprocessingml.document"
+            ),
+            use_container_width=True,
+        )
+    elif "transcription" in st.session_state:
+        st.warning(
+            "No se detectó voz. Prueba con el modo Mayor precisión o revisa "
+            "el volumen del audio."
+        )
