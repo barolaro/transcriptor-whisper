@@ -187,12 +187,15 @@ if uploaded_file is not None:
                     text=f"Transcribiendo… {progress * 100:.0f}%",
                 )
                 if text:
-                    preview.text_area(
-                        "Avance",
-                        value=text,
-                        height=200,
-                        disabled=True,
-                        label_visibility="collapsed",
+                    # Se usa un contenedor de texto (no un widget text_area)
+                    # para el avance en vivo: así no colisiona el ID con el
+                    # text_area editable final.
+                    preview.markdown(
+                        f"""<div style="max-height:200px;overflow-y:auto;
+                        padding:0.75rem;border:1px solid rgba(128,128,128,.3);
+                        border-radius:.5rem;white-space:pre-wrap;
+                        font-size:0.9rem;">{text}</div>""",
+                        unsafe_allow_html=True,
                     )
 
             bar.progress(1.0, text="Transcripción finalizada ✅")
