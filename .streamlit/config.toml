@@ -1,0 +1,10 @@
+[server]
+# Sube el límite del cargador de Streamlit (por defecto son 200 MB).
+# En Streamlit Community Cloud la RAM es acotada (~1 GB), así que aunque
+# permitas archivos grandes, lo que evita los cierres es el troceo del audio
+# (ver streamlit_app.py). 1000 MB es un tope razonable.
+maxUploadSize = 1000
+maxMessageSize = 1000
+
+[browser]
+gatherUsageStats = false
