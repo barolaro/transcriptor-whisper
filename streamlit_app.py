@@ -1,6 +1,8 @@
 import hashlib
 import io
 import os
+import re
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -15,38 +17,151 @@ st.set_page_config(
     layout="centered",
 )
 
-SUPPORTED_FORMATS = ["mp3", "wav", "m4a", "mp4", "aac", "ogg", "webm"]
+SUPPORTED_FORMATS = ["mp3", "wav", "m4a", "mp4", "aac", "ogg", "webm", "flac", "opus"]
+
+# --- Ajustes de robustez para audios largos/pesados ------------------------
+# Tope duro de subida (el config.toml manda en la práctica; esto es un aviso).
+MAX_UPLOAD_MB = 1000
+# Si el audio dura más que esto, se trocea en ventanas para no reventar la RAM
+# ni quedar "colgado" en Streamlit Cloud. Por debajo, va en una sola pasada.
+SINGLE_PASS_MAX_SECONDS = 12 * 60          # 12 min
+# Objetivo y tope de cada trozo. Se corta SIEMPRE en un silencio cercano al
+# objetivo, así no se parte ninguna palabra a la mitad.
+CHUNK_TARGET_SECONDS = 8 * 60              # ~8 min por trozo
+CHUNK_MAX_SECONDS = 12 * 60               # nunca más de 12 min sin cortar
+SILENCE_NOISE_DB = -30                     # umbral de "silencio"
+SILENCE_MIN_DURATION = 0.5                 # duración mínima de silencio (s)
 
 # Perfiles velocidad/calidad.
 #   - "base" es el piso razonable: rápido y mucho mejor que "tiny" en español.
 #   - "small" es el techo práctico en Streamlit Cloud gratuito (RAM ~1 GB):
 #     mucho mejor calidad, un poco más lento.
-# Se descartó "tiny" a propósito: es el que producía la mala calidad.
 MODEL_PROFILES = {
     "Rápido": {
         "model": "base",
         "beam_size": 1,
         "best_of": 1,
         "condition_on_previous_text": False,
-        "descripcion": "Más veloz. Bien para audio limpio, una sola voz.",
+        "descripcion": "Más veloz. Bien para audio limpio, una sola voz. "
+        "Recomendado para audios muy largos.",
     },
     "Recomendado · mejor calidad": {
         "model": "small",
         "beam_size": 5,
         "best_of": 5,
         "condition_on_previous_text": True,
-        "descripcion": "Bastante mejor con ruido, varias voces o términos técnicos.",
+        "descripcion": "Bastante mejor con ruido, varias voces o términos "
+        "técnicos. Más lento en audios largos.",
     },
 }
 
-# Pista inicial: orienta al modelo hacia español con puntuación y mayúsculas
-# correctas. Es "gratis" (no cuesta velocidad) y mejora acentos y formato.
+# Pista inicial: orienta al modelo hacia español con puntuación y mayúsculas.
 INITIAL_PROMPT = (
     "Transcripción en español de Chile, con puntuación, acentos y "
     "mayúsculas correctas."
 )
 
 
+# ---------------------------------------------------------------------------
+# Utilidades de ffmpeg (memoria acotada: todo pasa por disco, no por RAM)
+# ---------------------------------------------------------------------------
+def _run(cmd: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def save_upload_to_disk(uploaded_file) -> tuple[str, str, float]:
+    """Guarda la subida en disco leyéndola por trozos (sin cargar el archivo
+    completo en memoria de golpe) y devuelve (ruta, sha256, tamaño_MB)."""
+    suffix = Path(uploaded_file.name).suffix.lower() or ".audio"
+    hasher = hashlib.sha256()
+    size = 0
+    uploaded_file.seek(0)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        while True:
+            block = uploaded_file.read(1024 * 1024)  # 1 MB por vez
+            if not block:
+                break
+            hasher.update(block)
+            size += len(block)
+            tmp.write(block)
+        path = tmp.name
+    uploaded_file.seek(0)
+    return path, hasher.hexdigest(), size / (1024 * 1024)
+
+
+def to_wav_16k_mono(src_path: str) -> str:
+    """Reconvierte a WAV 16 kHz mono (la entrada nativa de Whisper). Reduce
+    el uso de memoria y normaliza cualquier formato de entrada."""
+    dst = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
+    proc = _run([
+        "ffmpeg", "-y", "-i", src_path,
+        "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", dst,
+    ])
+    if proc.returncode != 0 or not os.path.exists(dst):
+        raise RuntimeError(f"ffmpeg no pudo convertir el audio:\n{proc.stderr[-800:]}")
+    return dst
+
+
+def get_duration(path: str) -> float:
+    proc = _run([
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", path,
+    ])
+    try:
+        return float(proc.stdout.strip())
+    except ValueError:
+        return 0.0
+
+
+def detect_silence_midpoints(path: str) -> list[float]:
+    """Devuelve los puntos medios de cada silencio: son los mejores lugares
+    para cortar sin partir una palabra."""
+    proc = _run([
+        "ffmpeg", "-i", path,
+        "-af", f"silencedetect=noise={SILENCE_NOISE_DB}dB:d={SILENCE_MIN_DURATION}",
+        "-f", "null", "-",
+    ])
+    log = proc.stderr
+    starts = [float(x) for x in re.findall(r"silence_start: ([\d.]+)", log)]
+    ends = [float(x) for x in re.findall(r"silence_end: ([\d.]+)", log)]
+    return sorted((s + e) / 2.0 for s, e in zip(starts, ends))
+
+
+def plan_chunks(duration: float, silence_mids: list[float]) -> list[tuple[float, float]]:
+    """Arma los rangos [(inicio, fin)] cortando en el silencio más cercano al
+    objetivo. Si no hay silencio en la ventana, hace un corte duro."""
+    ranges: list[tuple[float, float]] = []
+    start = 0.0
+    while start < duration - 0.05:
+        ideal = start + CHUNK_TARGET_SECONDS
+        if ideal >= duration:
+            ranges.append((start, duration))
+            break
+        cands = [
+            m for m in silence_mids
+            if start + 30 < m < start + CHUNK_MAX_SECONDS
+        ]
+        cut = min(cands, key=lambda m: abs(m - ideal)) if cands else min(ideal, duration)
+        ranges.append((start, cut))
+        start = cut
+    return ranges
+
+
+def cut_wav(src_wav: str, start: float, end: float) -> str:
+    """Extrae un trozo [start, end) a un WAV pequeño (un solo trozo en RAM)."""
+    dst = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
+    proc = _run([
+        "ffmpeg", "-y", "-ss", f"{start:.3f}", "-to", f"{end:.3f}",
+        "-i", src_wav, "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", dst,
+    ])
+    if proc.returncode != 0 or not os.path.exists(dst):
+        raise RuntimeError(f"ffmpeg no pudo cortar el trozo:\n{proc.stderr[-500:]}")
+    return dst
+
+
+# ---------------------------------------------------------------------------
+# Modelo y transcripción
+# ---------------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def load_model(model_name: str) -> WhisperModel:
     """Carga una sola vez el modelo optimizado para CPU (INT8)."""
@@ -60,62 +175,72 @@ def load_model(model_name: str) -> WhisperModel:
     )
 
 
-def transcribe_stream(audio_bytes: bytes, suffix: str, profile: dict):
-    """Transcribe emitiendo cada segmento a medida que se completa.
+def _transcribe_file(model: WhisperModel, path: str, profile: dict):
+    """Generador crudo: entrega (texto_segmento, fin_relativo_al_archivo)."""
+    segments, _info = model.transcribe(
+        path,
+        language="es",
+        task="transcribe",
+        beam_size=profile["beam_size"],
+        best_of=profile["best_of"],
+        temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+        compression_ratio_threshold=2.4,
+        log_prob_threshold=-1.0,
+        no_speech_threshold=0.6,
+        condition_on_previous_text=profile["condition_on_previous_text"],
+        initial_prompt=INITIAL_PROMPT,
+        vad_filter=True,
+        vad_parameters={"min_silence_duration_ms": 500, "speech_pad_ms": 400},
+    )
+    for seg in segments:
+        yield seg.text.strip(), seg.end
 
-    Es un generador: entrega (texto_acumulado, progreso 0-1). Esto permite
-    mostrar avance real y evita la sensación de que la app quedó congelada.
-    """
-    temp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(audio_bytes)
-            temp_path = tmp.name
 
-        model = load_model(profile["model"])
-        segments, info = model.transcribe(
-            temp_path,
-            language="es",
-            task="transcribe",
-            beam_size=profile["beam_size"],
-            best_of=profile["best_of"],
-            # Fallback de temperatura: si un tramo sale con baja confianza o
-            # texto "basura", reintenta con más aleatoriedad. Sube robustez.
-            temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
-            compression_ratio_threshold=2.4,
-            log_prob_threshold=-1.0,
-            no_speech_threshold=0.6,
-            condition_on_previous_text=profile["condition_on_previous_text"],
-            initial_prompt=INITIAL_PROMPT,
-            vad_filter=True,
-            # speech_pad_ms=400 evita cortar la primera/última palabra de cada
-            # tramo de voz: causa frecuente de palabras "comidas".
-            vad_parameters={
-                "min_silence_duration_ms": 500,
-                "speech_pad_ms": 400,
-            },
-        )
+def transcribe_stream(wav_path: str, duration: float, profile: dict):
+    """Transcribe con progreso real. Si el audio es largo, lo trocea por
+    silencios y procesa un trozo a la vez (memoria acotada). Entrega
+    (texto_acumulado, progreso 0-1, duración_total)."""
+    model = load_model(profile["model"])
+    parts: list[str] = []
+    total = duration or 0.0
 
-        total = float(info.duration) or 0.0
-        parts: list[str] = []
-        for seg in segments:
-            parts.append(seg.text.strip())
-            progress = min(1.0, seg.end / total) if total else 0.0
+    # Camino corto: audio breve → una sola pasada (máxima calidad de contexto).
+    if total <= SINGLE_PASS_MAX_SECONDS:
+        for text, end in _transcribe_file(model, wav_path, profile):
+            parts.append(text)
+            progress = min(1.0, end / total) if total else 0.0
             yield " ".join(parts).strip(), progress, total
-
-        # Garantiza un último yield con progreso completo aunque no haya voz.
         yield " ".join(parts).strip(), 1.0, total
-    finally:
-        if temp_path and os.path.exists(temp_path):
-            os.remove(temp_path)
+        return
+
+    # Camino largo: trocear por silencios y transcribir trozo a trozo.
+    mids = detect_silence_midpoints(wav_path)
+    chunks = plan_chunks(total, mids)
+    for start, end in chunks:
+        chunk_path = None
+        try:
+            chunk_path = cut_wav(wav_path, start, end)
+            for text, seg_end in _transcribe_file(model, chunk_path, profile):
+                if text:
+                    parts.append(text)
+                # progreso global = (inicio del trozo + avance dentro) / total
+                processed = start + seg_end
+                progress = min(1.0, processed / total) if total else 0.0
+                yield " ".join(parts).strip(), progress, total
+        finally:
+            if chunk_path and os.path.exists(chunk_path):
+                os.remove(chunk_path)
+    yield " ".join(parts).strip(), 1.0, total
 
 
+# ---------------------------------------------------------------------------
+# Salida Word
+# ---------------------------------------------------------------------------
 def create_word_document(text: str, original_name: str) -> bytes:
     document = Document()
     document.add_heading("Transcripción de audio", 0)
     document.add_paragraph(f"Archivo: {original_name}")
     document.add_paragraph(text)
-
     buffer = io.BytesIO()
     document.save(buffer)
     return buffer.getvalue()
@@ -124,77 +249,75 @@ def create_word_document(text: str, original_name: str) -> bytes:
 def reset_result_if_file_changed(file_id: str) -> None:
     if st.session_state.get("current_file_id") != file_id:
         st.session_state.current_file_id = file_id
-        st.session_state.pop("transcription", None)
-        st.session_state.pop("duration", None)
-        st.session_state.pop("result_key", None)
+        for k in ("transcription", "duration", "result_key"):
+            st.session_state.pop(k, None)
 
 
+# ---------------------------------------------------------------------------
+# Interfaz
+# ---------------------------------------------------------------------------
 st.title("🎙️ Transcriptor de Audio")
 st.write(
     "Sube un audio y obtén su transcripción en español. "
-    "El procesamiento comienza solo cuando presionas **Transcribir**."
+    "El procesamiento comienza solo cuando presionas **Transcribir**. "
+    "Los audios largos se procesan por tramos, así no se cuelga."
 )
 
 model_label = st.radio(
     "Velocidad / calidad",
     options=list(MODEL_PROFILES),
-    index=1,  # por defecto: mejor calidad
+    index=1,
     horizontal=True,
 )
 st.caption(MODEL_PROFILES[model_label]["descripcion"])
 
-uploaded_file = st.file_uploader(
-    "📂 Sube tu archivo de audio",
-    type=SUPPORTED_FORMATS,
-)
+uploaded_file = st.file_uploader("📂 Sube tu archivo de audio", type=SUPPORTED_FORMATS)
 
 if uploaded_file is not None:
-    audio_bytes = uploaded_file.getvalue()
-    file_id = hashlib.sha256(audio_bytes).hexdigest()
+    # Se guarda a disco por trozos (no carga el archivo completo en RAM).
+    src_path, file_id, size_mb = save_upload_to_disk(uploaded_file)
     reset_result_if_file_changed(file_id)
-
-    size_mb = len(audio_bytes) / (1024 * 1024)
     st.caption(f"{uploaded_file.name} · {size_mb:.1f} MB")
 
-    if size_mb > 200:
-        st.error("El archivo supera el límite de 200 MB.")
+    if size_mb > MAX_UPLOAD_MB:
+        st.error(f"El archivo supera el límite de {MAX_UPLOAD_MB} MB.")
+        os.remove(src_path)
         st.stop()
 
     profile = MODEL_PROFILES[model_label]
-    # La clave incluye el modelo: si cambias de perfil, no reusa un resultado
-    # de otra calidad, pero sí evita recalcular al descargar.
     result_key = f"{file_id}:{profile['model']}:{profile['beam_size']}"
 
+    if size_mb > 150:
+        st.info(
+            "Es un audio pesado. En un servidor gratuito puede tardar bastante; "
+            "si va muy lento, prueba el modo **Rápido**."
+        )
+
     if st.button("🚀 Transcribir audio", type="primary", use_container_width=True):
-        suffix = Path(uploaded_file.name).suffix.lower() or ".audio"
+        wav_path = None
         try:
             st.info(
                 "La primera vez puede tardar más mientras se descarga y carga "
                 "el modelo. Las siguientes son más rápidas."
             )
-            bar = st.progress(0.0, text="Preparando el modelo…")
+            bar = st.progress(0.0, text="Preparando el audio…")
             preview = st.empty()
 
+            # Normaliza a WAV 16k mono antes de transcribir.
+            wav_path = to_wav_16k_mono(src_path)
+            duration = get_duration(wav_path)
+
             final_text = ""
-            duration = 0.0
-            for text, progress, total in transcribe_stream(
-                audio_bytes, suffix, profile
-            ):
+            for text, progress, total in transcribe_stream(wav_path, duration, profile):
                 final_text = text
                 duration = total
-                bar.progress(
-                    progress,
-                    text=f"Transcribiendo… {progress * 100:.0f}%",
-                )
+                bar.progress(progress, text=f"Transcribiendo… {progress * 100:.0f}%")
                 if text:
-                    # Se usa un contenedor de texto (no un widget text_area)
-                    # para el avance en vivo: así no colisiona el ID con el
-                    # text_area editable final.
                     preview.markdown(
                         f"""<div style="max-height:200px;overflow-y:auto;
                         padding:0.75rem;border:1px solid rgba(128,128,128,.3);
                         border-radius:.5rem;white-space:pre-wrap;
-                        font-size:0.9rem;">{text}</div>""",
+                        font-size:0.9rem;">{text[-4000:]}</div>""",
                         unsafe_allow_html=True,
                     )
 
@@ -210,8 +333,12 @@ if uploaded_file is not None:
                 "no esté dañado e inténtalo nuevamente."
             )
             st.exception(exc)
+        finally:
+            if wav_path and os.path.exists(wav_path):
+                os.remove(wav_path)
+            if os.path.exists(src_path):
+                os.remove(src_path)
 
-    # Se muestra el resultado solo si corresponde al perfil/archivo actual.
     transcription = st.session_state.get("transcription")
     if transcription and st.session_state.get("result_key") == result_key:
         duration = st.session_state.get("duration", 0)
