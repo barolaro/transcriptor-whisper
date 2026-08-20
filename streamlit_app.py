@@ -45,12 +45,12 @@ MODEL_PROFILES = {
         "Recomendado para audios muy largos.",
     },
     "Recomendado · mejor calidad": {
-        "model": "small",
-        "beam_size": 5,
-        "best_of": 5,
+        "model": "base",
+        "beam_size": 3,
+        "best_of": 3,
         "condition_on_previous_text": True,
-        "descripcion": "Bastante mejor con ruido, varias voces o términos "
-        "técnicos. Más lento en audios largos.",
+        "descripcion": "Mejor revisión de alternativas usando el mismo modelo liviano. "
+        "Más lento en audios largos.",
     },
 }
 
@@ -171,7 +171,7 @@ def cut_audio_chunk(src_path: str, start: float, end: float) -> str:
 @st.cache_resource(show_spinner=False)
 def load_model(model_name: str) -> WhisperModel:
     """Carga una sola vez el modelo optimizado para CPU (INT8)."""
-    cpu_threads = max(1, min(4, os.cpu_count() or 1))
+    cpu_threads = max(1, min(2, os.cpu_count() or 1))
     return WhisperModel(
         model_name,
         device="cpu",
