@@ -5,4 +5,3 @@ dependencies:
   - python=3.11
   - streamlit=1.50.0
   - snowflake-snowpark-python
-  - python-docx
