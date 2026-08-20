@@ -24,11 +24,10 @@ SUPPORTED_FORMATS = ["mp3", "wav", "m4a", "mp4", "aac", "ogg", "webm", "flac", "
 MAX_UPLOAD_MB = 1000
 # Si el audio dura más que esto, se trocea en ventanas para no reventar la RAM
 # ni quedar "colgado" en Streamlit Cloud. Por debajo, va en una sola pasada.
-SINGLE_PASS_MAX_SECONDS = 12 * 60          # 12 min
-# Objetivo y tope de cada trozo. Se corta SIEMPRE en un silencio cercano al
-# objetivo, así no se parte ninguna palabra a la mitad.
-CHUNK_TARGET_SECONDS = 8 * 60              # ~8 min por trozo
-CHUNK_MAX_SECONDS = 12 * 60               # nunca más de 12 min sin cortar
+SINGLE_PASS_MAX_SECONDS = 5 * 60           # 5 min
+# Fragmentos pequeños reducen el uso máximo de RAM en Streamlit gratuito.
+CHUNK_TARGET_SECONDS = 4 * 60               # ~4 min por trozo
+CHUNK_MAX_SECONDS = 5 * 60                  # nunca más de 5 min sin cortar
 SILENCE_NOISE_DB = -30                     # umbral de "silencio"
 SILENCE_MIN_DURATION = 0.5                 # duración mínima de silencio (s)
 
@@ -147,15 +146,22 @@ def plan_chunks(duration: float, silence_mids: list[float]) -> list[tuple[float,
     return ranges
 
 
-def cut_wav(src_wav: str, start: float, end: float) -> str:
-    """Extrae un trozo [start, end) a un WAV pequeño (un solo trozo en RAM)."""
+def cut_audio_chunk(src_path: str, start: float, end: float) -> str:
+    """Convierte solo un fragmento a WAV 16 kHz mono.
+
+    Evita crear una copia WAV completa del audio, que era el principal pico
+    de disco y memoria en Streamlit Community Cloud.
+    """
     dst = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
     proc = _run([
         "ffmpeg", "-y", "-ss", f"{start:.3f}", "-to", f"{end:.3f}",
-        "-i", src_wav, "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", dst,
+        "-i", src_path, "-vn", "-ac", "1", "-ar", "16000",
+        "-c:a", "pcm_s16le", dst,
     ])
     if proc.returncode != 0 or not os.path.exists(dst):
-        raise RuntimeError(f"ffmpeg no pudo cortar el trozo:\n{proc.stderr[-500:]}")
+        raise RuntimeError(
+            f"ffmpeg no pudo preparar el fragmento:\n{proc.stderr[-500:]}"
+        )
     return dst
 
 
@@ -196,41 +202,40 @@ def _transcribe_file(model: WhisperModel, path: str, profile: dict):
         yield seg.text.strip(), seg.end
 
 
-def transcribe_stream(wav_path: str, duration: float, profile: dict):
-    """Transcribe con progreso real. Si el audio es largo, lo trocea por
-    silencios y procesa un trozo a la vez (memoria acotada). Entrega
-    (texto_acumulado, progreso 0-1, duración_total)."""
+def transcribe_stream(src_path: str, duration: float, profile: dict):
+    """Transcribe siempre por fragmentos pequeños y limita el pico de RAM."""
     model = load_model(profile["model"])
     parts: list[str] = []
     total = duration or 0.0
 
-    # Camino corto: audio breve → una sola pasada (máxima calidad de contexto).
-    if total <= SINGLE_PASS_MAX_SECONDS:
-        for text, end in _transcribe_file(model, wav_path, profile):
-            parts.append(text)
-            progress = min(1.0, end / total) if total else 0.0
-            yield " ".join(parts).strip(), progress, total
-        yield " ".join(parts).strip(), 1.0, total
-        return
+    if total <= 0:
+        raise RuntimeError("No fue posible determinar la duración del audio.")
 
-    # Camino largo: trocear por silencios y transcribir trozo a trozo.
-    mids = detect_silence_midpoints(wav_path)
+    # Detectar silencios lee el archivo, pero no crea una copia WAV completa.
+    mids = detect_silence_midpoints(src_path)
     chunks = plan_chunks(total, mids)
-    for start, end in chunks:
+
+    for chunk_number, (start, end) in enumerate(chunks, start=1):
         chunk_path = None
         try:
-            chunk_path = cut_wav(wav_path, start, end)
+            chunk_path = cut_audio_chunk(src_path, start, end)
             for text, seg_end in _transcribe_file(model, chunk_path, profile):
                 if text:
                     parts.append(text)
-                # progreso global = (inicio del trozo + avance dentro) / total
-                processed = start + seg_end
-                progress = min(1.0, processed / total) if total else 0.0
-                yield " ".join(parts).strip(), progress, total
+                processed = min(end, start + seg_end)
+                progress = min(0.99, processed / total)
+                yield (
+                    " ".join(parts).strip(),
+                    progress,
+                    total,
+                    chunk_number,
+                    len(chunks),
+                )
         finally:
             if chunk_path and os.path.exists(chunk_path):
                 os.remove(chunk_path)
-    yield " ".join(parts).strip(), 1.0, total
+
+    yield " ".join(parts).strip(), 1.0, total, len(chunks), len(chunks)
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +299,6 @@ if uploaded_file is not None:
         )
 
     if st.button("🚀 Transcribir audio", type="primary", use_container_width=True):
-        wav_path = None
         try:
             st.info(
                 "La primera vez puede tardar más mientras se descarga y carga "
@@ -303,15 +307,22 @@ if uploaded_file is not None:
             bar = st.progress(0.0, text="Preparando el audio…")
             preview = st.empty()
 
-            # Normaliza a WAV 16k mono antes de transcribir.
-            wav_path = to_wav_16k_mono(src_path)
-            duration = get_duration(wav_path)
+            duration = get_duration(src_path)
 
             final_text = ""
-            for text, progress, total in transcribe_stream(wav_path, duration, profile):
+            for text, progress, total, chunk_no, chunk_count in transcribe_stream(
+                src_path, duration, profile
+            ):
                 final_text = text
                 duration = total
-                bar.progress(progress, text=f"Transcribiendo… {progress * 100:.0f}%")
+                if progress < 1.0:
+                    status = (
+                        f"Transcribiendo fragmento {chunk_no} de {chunk_count}… "
+                        f"{progress * 100:.0f}%"
+                    )
+                else:
+                    status = "Guardando el resultado…"
+                bar.progress(progress, text=status)
                 if text:
                     preview.markdown(
                         f"""<div style="max-height:200px;overflow-y:auto;
@@ -321,12 +332,13 @@ if uploaded_file is not None:
                         unsafe_allow_html=True,
                     )
 
-            bar.progress(1.0, text="Transcripción finalizada ✅")
-            preview.empty()
-
+            # Guardar antes de anunciar el 100 % definitivo.
             st.session_state.transcription = final_text
             st.session_state.duration = duration
             st.session_state.result_key = result_key
+
+            preview.empty()
+            bar.progress(1.0, text="Transcripción guardada ✅")
         except Exception as exc:
             st.error(
                 "No fue posible procesar el audio. Comprueba que el archivo "
@@ -334,8 +346,6 @@ if uploaded_file is not None:
             )
             st.exception(exc)
         finally:
-            if wav_path and os.path.exists(wav_path):
-                os.remove(wav_path)
             if os.path.exists(src_path):
                 os.remove(src_path)
 
