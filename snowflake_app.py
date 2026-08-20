@@ -3,11 +3,11 @@ import json
 import os
 import tempfile
 import uuid
+import zipfile
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 import streamlit as st
-from docx import Document
-from snowflake.snowpark.context import get_active_session
 
 
 STAGE_NAME = "TRANSCRIPTOR_AUDIO_STAGE"
@@ -18,12 +18,38 @@ st.set_page_config(page_title="Transcriptor de Audio", page_icon="🎙️")
 
 
 def create_word_document(text: str, original_name: str) -> bytes:
-    document = Document()
-    document.add_heading("Transcripción de audio", 0)
-    document.add_paragraph(f"Archivo: {original_name}")
-    document.add_paragraph(text)
     buffer = io.BytesIO()
-    document.save(buffer)
+    paragraphs = ["Transcripción de audio", f"Archivo: {original_name}"] + text.splitlines()
+    body = "".join(
+        f'<w:p><w:r><w:t xml:space="preserve">{escape(line)}</w:t></w:r></w:p>'
+        for line in paragraphs
+    )
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/word/document.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+        '</Types>'
+    )
+    relationships = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+        'Target="word/document.xml"/>'
+        '</Relationships>'
+    )
+    document_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        f'<w:body>{body}<w:sectPr/></w:body></w:document>'
+    )
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", content_types)
+        archive.writestr("_rels/.rels", relationships)
+        archive.writestr("word/document.xml", document_xml)
     return buffer.getvalue()
 
 
@@ -61,7 +87,7 @@ def format_speaker_transcript(result: dict) -> str:
 
 
 def transcribe(uploaded_file, identify_speakers: bool):
-    session = get_active_session()
+    session = st.connection("snowflake").session()
     session.sql(
         f"CREATE STAGE IF NOT EXISTS {STAGE_NAME} DIRECTORY=(ENABLE=TRUE)"
     ).collect()
